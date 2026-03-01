@@ -15,6 +15,7 @@ from dggt.heads.track_head import TrackHead
 from dggt.heads.gs_head import GaussianDecoder
 from dggt.models.sky import SkyGaussian
 from dggt.models.fusion import PointNetGSFusion
+from dggt.models.DGDA import dgda_params as _dgda_params, save_dgda as _save_dgda, load_dgda as _load_dgda
 #from dggt.splatformer.feature_predictor import FeaturePredictor
 
 
@@ -41,18 +42,67 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
         #self.point_offset_head = DPTHead(dim_in=2 * embed_dim, output_dim=4, activation="inv_log_1")
 
 
+    # ------------------------------------------------------------------
+    # DGDA 顶层接口
+    # ------------------------------------------------------------------
+
+    def enable_dgda(
+        self,
+        r: int = 8,
+        lora_alpha: float = 16,
+        dropout: float = 0.1,
+        start_layer: int = 16,
+        targets=("attn.qkv", "attn.proj"),
+        freeze_backbone: bool = True,
+    ) -> None:
+        """注入 DynamicGatedLoRA，委托给 aggregator.enable_dgda()。"""
+        self.aggregator.enable_dgda(
+            r=r,
+            lora_alpha=lora_alpha,
+            dropout=dropout,
+            start_layer=start_layer,
+            targets=targets,
+            freeze_backbone=freeze_backbone,
+        )
+
+    def dgda_params(self):
+        """返回 aggregator 中所有可训练 DGDA 参数的迭代器，供优化器使用。"""
+        return _dgda_params(self.aggregator)
+
+    def save_dgda(self, path: str) -> None:
+        """只保存 DGDA 适配器权重（不含冻结骨干，文件体积小）。"""
+        _save_dgda(self.aggregator, path)
+
+    def load_dgda(self, path: str) -> None:
+        """从文件加载 DGDA 适配器权重（strict=False，骨干权重不受影响）。"""
+        _load_dgda(self.aggregator, path)
+
+    # ------------------------------------------------------------------
+
     def forward(
         self,
         images: torch.Tensor,
         query_points: torch.Tensor = None,
+        dynamic_conf: torch.Tensor = None,
     ):
+        """
+        Args:
+            images:       [B, S, 3, H, W]
+            query_points: [B, N, 3] optional tracking query points
+            dynamic_conf: [B, S, H_patch, W_patch] optional dynamic confidence map
+                          from a previous step's instance_head output (0–1).
+                          Passed into aggregator for DGDA gate modulation.
+                          None on the first step or when DGDA is not enabled.
+        """
         # If without batch dimension, add it
         if len(images.shape) == 4:
             images = images.unsqueeze(0)
         if query_points is not None and len(query_points.shape) == 2:
             query_points = query_points.unsqueeze(0)
 
-        aggregated_tokens_list, image_tokens_list, dino_token_list, image_feature, patch_start_idx = self.aggregator(images)
+        aggregated_tokens_list, image_tokens_list, dino_token_list, image_feature, patch_start_idx = self.aggregator(
+            images, dynamic_conf=dynamic_conf
+        )
         
         predictions = {}
 

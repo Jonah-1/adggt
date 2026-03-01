@@ -14,6 +14,7 @@ from dggt.layers import PatchEmbed
 from dggt.layers.block import Block
 from dggt.layers.rope import RotaryPositionEmbedding2D, PositionGetter
 from dggt.layers.vision_transformer import vit_small, vit_base, vit_large, vit_giant2
+from dggt.models.DGDA import inject_dgda, prepare_dynamic_conf, clear_dynamic_conf
 from IPython import embed
 logger = logging.getLogger(__name__)
 
@@ -186,14 +187,51 @@ class Aggregator(nn.Module):
 
 
 
+    def enable_dgda(
+        self,
+        r: int = 8,
+        lora_alpha: float = 16,
+        dropout: float = 0.1,
+        start_layer: int = 16,
+        targets: List[str] = ("attn.qkv", "attn.proj"),
+        freeze_backbone: bool = True,
+    ) -> None:
+        """
+        向 frame_blocks / global_blocks 的高层 Attention 注入 DynamicGatedLoRA。
+
+        默认策略（方案 C）：仅 layer 16-23 的 attn.qkv + attn.proj，共 32 个 DGDA 模块。
+
+        Args:
+            r:               LoRA 秩
+            lora_alpha:      LoRA 缩放系数
+            dropout:         LoRA 输入 Dropout 率
+            start_layer:     从哪一层开始注入（默认 16）
+            targets:         Block 内要替换的子 Linear 路径
+            freeze_backbone: 若 True，冻结全部骨干，只保留 DGDA 参数可训练
+        """
+        self._dgda_start_layer = start_layer
+        inject_dgda(
+            self,
+            r=r,
+            lora_alpha=lora_alpha,
+            dropout=dropout,
+            start_layer=start_layer,
+            targets=list(targets),
+            freeze_backbone=freeze_backbone,
+        )
+
     def forward(
         self,
         images: torch.Tensor,
+        dynamic_conf: Optional[torch.Tensor] = None,
     ) -> Tuple[List[torch.Tensor], int]:
         """
         Args:
             images (torch.Tensor): Input images with shape [B, S, 3, H, W], in range [0, 1].
                 B: batch size, S: sequence length, 3: RGB channels, H: height, W: width
+            dynamic_conf (torch.Tensor, optional): [B, S, H_patch, W_patch] dynamic confidence
+                map from instance_head (0–1). Injected into DGDA modules of high layers.
+                None → DGDA modules use mask=0.5 (equal-weight, degrades to plain LoRA).
 
         Returns:
             (list[torch.Tensor], int):
@@ -250,6 +288,11 @@ class Aggregator(nn.Module):
         # update P because we added special tokens
         _, P, C = tokens.shape
 
+        # 将 dynamic_conf 注入到高层 DGDA 模块（仅当 enable_dgda() 已被调用时生效）
+        dgda_start = getattr(self, "_dgda_start_layer", None)
+        if dgda_start is not None:
+            prepare_dynamic_conf(self, dynamic_conf, B, S, P, start_layer=dgda_start)
+
         frame_idx = 0
         global_idx = 0
         output_list = []
@@ -284,6 +327,11 @@ class Aggregator(nn.Module):
         del frame_intermediates
         del global_intermediates
         del concat_inter_with_tokens
+
+        # 兜底清理：防止异常路径下 _dynamic_conf 残留
+        if dgda_start is not None:
+            clear_dynamic_conf(self, start_layer=dgda_start)
+
         return output_list, output_list_with_tokens, dino_token_list, image_feature, self.patch_start_idx
 
     def _process_frame_attention(self, tokens, B, S, P, C, frame_idx, pos=None):

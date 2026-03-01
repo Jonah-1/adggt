@@ -47,6 +47,12 @@ def parse_args():
     parser.add_argument('--local_rank', type=int, default=0)
     parser.add_argument('--use_splatformer', type=bool, default=False)
     parser.add_argument('--downsample_3dgs', type=bool, default=False)
+    # DGDA (方案 C: 高层 + Attention-only)
+    parser.add_argument('--use_dgda', action='store_true', help='enable DGDA adapter (layer 16-23, attn only)')
+    parser.add_argument('--dgda_r', type=int, default=8)
+    parser.add_argument('--dgda_lora_alpha', type=float, default=16.0)
+    parser.add_argument('--dgda_dropout', type=float, default=0.1)
+    parser.add_argument('--dgda_start_layer', type=int, default=16)
     return parser.parse_args()
 
 def main(args):
@@ -69,28 +75,45 @@ def main(args):
     checkpoint = torch.load(args.ckpt_path, map_location="cpu")
     model.load_state_dict(checkpoint, strict=False)
 
+    if args.use_dgda:
+        model.enable_dgda(
+            r=args.dgda_r,
+            lora_alpha=args.dgda_lora_alpha,
+            dropout=args.dgda_dropout,
+            start_layer=args.dgda_start_layer,
+            targets=("attn.qkv", "attn.proj"),
+            freeze_backbone=True,
+        )
+        if args.local_rank == 0:
+            print("[DGDA] enabled: start_layer=%d, r=%d, lora_alpha=%.1f" % (args.dgda_start_layer, args.dgda_r, args.dgda_lora_alpha))
+
     model.train()
     model = DDP(model, device_ids=[args.local_rank]) #, find_unused_parameters=True)
     model._set_static_graph()
-    
-    lpips_loss_fn = lpips.LPIPS(net='alex').to(device)
 
+    lpips_loss_fn = lpips.LPIPS(net='alex').to(device)
 
     binary_loss_fn = torch.nn.BCEWithLogitsLoss(reduction='mean')
     semantic_loss_fn = torch.nn.CrossEntropyLoss(ignore_index=255)
 
     for param in model.module.parameters():
         param.requires_grad = False
-    for head_name in ["gs_head","instance_head","sky_model" ]: #, "gs_head","instance_head","sky_model", "semantic_head"
+    for head_name in ["gs_head", "instance_head", "sky_model"]:
         for param in getattr(model.module, head_name).parameters():
             param.requires_grad = True
+    if args.use_dgda:
+        for param in model.module.dgda_params():
+            param.requires_grad = True
 
-    optimizer = AdamW([
-        {'params': model.module.gs_head.parameters(), 'lr': 4e-5},
-        # {'params': model.module.semantic_head.parameters(), 'lr': 1e-4},
-        {'params': model.module.instance_head.parameters(), 'lr': 4e-5},
-        {'params': model.module.sky_model.parameters(), 'lr': 1e-4},
-    ], weight_decay=1e-4)
+    param_groups = []
+    if args.use_dgda:
+        param_groups.append({"params": list(model.module.dgda_params()), "lr": 1e-4})
+    param_groups.extend([
+        {"params": model.module.gs_head.parameters(), "lr": 4e-5},
+        {"params": model.module.instance_head.parameters(), "lr": 4e-5},
+        {"params": model.module.sky_model.parameters(), "lr": 1e-4},
+    ])
+    optimizer = AdamW(param_groups, weight_decay=1e-4)
 
     warmup_iterations = 1000
     scheduler = LambdaLR(
@@ -246,8 +269,11 @@ def main(args):
             T.ToPILImage()(combined).save(os.path.join(args.log_dir, "images", f"step_{step}_frame_{random_frame_idx}.png"))
         
         if args.local_rank == 0 and step > 0 and step % args.save_ckpt == 0:
-            ckpt_path = os.path.join(args.log_dir, "ckpt", f"model_latest.pt")
+            ckpt_path = os.path.join(args.log_dir, "ckpt", "model_latest.pt")
             torch.save(model.module.state_dict(), ckpt_path)
+            if args.use_dgda:
+                dgda_path = os.path.join(args.log_dir, "ckpt", "dgda_adapter_latest.pth")
+                model.module.save_dgda(dgda_path)
             print(f"[Checkpoint] Saved model at step {step} to {ckpt_path}")
 
 if __name__ == "__main__":
