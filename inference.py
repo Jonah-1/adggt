@@ -91,6 +91,14 @@ def main():
     parser.add_argument('-metrics', action='store_true', help='Whether to output evaluation metrics')
     parser.add_argument('-diffusion', action='store_true', help='Whether to process images with diffusion model')
     parser.add_argument('--intervals', type=int, default=2, help='Interval for mode=3')
+    # DGDA (与 train 一致)
+    parser.add_argument('--use_dgda', action='store_true', help='enable DGDA adapter (layer 16-23, attn only)')
+    parser.add_argument('--dgda_ckpt', type=str, default='', help='path to DGDA adapter .pth (optional, main ckpt may already include DGDA)')
+    parser.add_argument('--dgda_r', type=int, default=8)
+    parser.add_argument('--dgda_lora_alpha', type=float, default=16.0)
+    parser.add_argument('--dgda_dropout', type=float, default=0.1)
+    parser.add_argument('--dgda_start_layer', type=int, default=16)
+    parser.add_argument('--use_dgda_mask_update', action='store_true', help='when twopass, update mask every 4 layers')
     args = parser.parse_args()
     os.makedirs(args.output_path, exist_ok=True)
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -122,7 +130,23 @@ def main():
 
     model = VGGT().to(device)
     checkpoint = torch.load(args.ckpt_path, map_location="cpu")
-    model.load_state_dict(checkpoint, strict=True)
+    if args.use_dgda:
+        model.enable_dgda(
+            r=args.dgda_r,
+            lora_alpha=args.dgda_lora_alpha,
+            dropout=args.dgda_dropout,
+            start_layer=args.dgda_start_layer,
+            targets=("attn.qkv", "attn.proj"),
+            freeze_backbone=True,
+            twopass=True,
+            use_mask_update=args.use_dgda_mask_update,
+            chunk_size=4,
+        )
+        print("[DGDA] enabled: start_layer=%d, r=%d, twopass=True" % (args.dgda_start_layer, args.dgda_r))
+    model.load_state_dict(checkpoint, strict=not args.use_dgda)
+    if args.use_dgda and args.dgda_ckpt and os.path.isfile(args.dgda_ckpt):
+        model.load_dgda(args.dgda_ckpt)
+        print("[DGDA] loaded adapter from %s" % args.dgda_ckpt)
     if args.mode == 3:
         track_ckpt = 'path_to_track_model'
         track_model = load_model(track_ckpt)
