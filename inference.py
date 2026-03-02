@@ -321,7 +321,7 @@ def main():
             scene_name = str(scene_idx).zfill(3)
             inference_time = time.time() - start_time
             inference_time_list.append(inference_time)
-            if args.difix:
+            if args.diffusion:
                 processed_frames = []
                 for i in range(rendered_image.shape[0]):
                     frame = rendered_image[i].detach().cpu().clamp(0, 1)
