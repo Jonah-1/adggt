@@ -4,6 +4,8 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+from typing import Optional
+
 import torch
 import torch.nn as nn
 from huggingface_hub import PyTorchModelHubMixin  # used for model hub
@@ -54,8 +56,12 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
         start_layer: int = 16,
         targets=("attn.qkv", "attn.proj"),
         freeze_backbone: bool = True,
+        use_mask_update: bool = False,
+        chunk_size: int = 4,
+        twopass: bool = False,
     ) -> None:
-        """注入 DynamicGatedLoRA，委托给 aggregator.enable_dgda()。"""
+        """注入 DynamicGatedLoRA，委托给 aggregator.enable_dgda()。twopass=True 时先跑完全程取掩码再跑一遍注入。"""
+        self.use_dgda_twopass = twopass
         self.aggregator.enable_dgda(
             r=r,
             lora_alpha=lora_alpha,
@@ -63,6 +69,8 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
             start_layer=start_layer,
             targets=targets,
             freeze_backbone=freeze_backbone,
+            use_mask_update=use_mask_update,
+            chunk_size=chunk_size,
         )
 
     def dgda_params(self):
@@ -93,13 +101,28 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                           from a previous step's instance_head output (0–1).
                           Passed into aggregator for DGDA gate modulation.
                           None on the first step or when DGDA is not enabled.
+
+        When use_dgda_twopass is True (enable_dgda(..., twopass=True)): first run full forward
+        with dynamic_conf=None to get instance_head mask, then run again with that mask injected;
+        in the second run the mask is updated every 4 layers from current features (if use_mask_update).
         """
-        # If without batch dimension, add it
         if len(images.shape) == 4:
             images = images.unsqueeze(0)
         if query_points is not None and len(query_points.shape) == 2:
             query_points = query_points.unsqueeze(0)
 
+        if getattr(self, "use_dgda_twopass", False) and dynamic_conf is None:
+            pred1 = self._forward_impl(images, query_points, None)
+            return self._forward_impl(images, query_points, pred1["dynamic_conf"])
+
+        return self._forward_impl(images, query_points, dynamic_conf)
+
+    def _forward_impl(
+        self,
+        images: torch.Tensor,
+        query_points: torch.Tensor,
+        dynamic_conf: Optional[torch.Tensor],
+    ):
         aggregated_tokens_list, image_tokens_list, dino_token_list, image_feature, patch_start_idx = self.aggregator(
             images, dynamic_conf=dynamic_conf
         )

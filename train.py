@@ -53,6 +53,7 @@ def parse_args():
     parser.add_argument('--dgda_lora_alpha', type=float, default=16.0)
     parser.add_argument('--dgda_dropout', type=float, default=0.1)
     parser.add_argument('--dgda_start_layer', type=int, default=16)
+    parser.add_argument('--use_dgda_mask_update', action='store_true', help='when twopass, update mask every 4 layers from current features')
     return parser.parse_args()
 
 def main(args):
@@ -83,9 +84,12 @@ def main(args):
             start_layer=args.dgda_start_layer,
             targets=("attn.qkv", "attn.proj"),
             freeze_backbone=True,
+            twopass=True,  # 每个 batch 内先跑完整网络取掩码，再跑第二遍注入该掩码
+            use_mask_update=args.use_dgda_mask_update,
+            chunk_size=4,
         )
         if args.local_rank == 0:
-            print("[DGDA] enabled: start_layer=%d, r=%d, lora_alpha=%.1f" % (args.dgda_start_layer, args.dgda_r, args.dgda_lora_alpha))
+            print("[DGDA] enabled: start_layer=%d, r=%d, twopass=True" % (args.dgda_start_layer, args.dgda_r))
 
     model.train()
     model = DDP(model, device_ids=[args.local_rank]) #, find_unused_parameters=True)
@@ -123,7 +127,7 @@ def main(args):
     )
 
     for step in tqdm(range(args.max_epoch)):
-        sampler.set_epoch(step)        
+        sampler.set_epoch(step)
         for batch in dataloader:
             images = batch['images'].to(device)
             sky_mask = batch['masks'].to(device).permute(0, 1, 3, 4, 2)
@@ -132,9 +136,10 @@ def main(args):
 
             if 'dynamic_mask' in batch:
                 dynamic_masks = batch['dynamic_mask'].to(device)[:, :, 0, :, :]
-            
+
             optimizer.zero_grad()
 
+            # use_dgda 且 twopass 时：model(images) 内部会先跑完整网络取 instance_head 掩码，再跑第二遍注入
             with torch.cuda.amp.autocast(dtype=dtype):
                 predictions = model(images)
                 H, W = images.shape[-2:]

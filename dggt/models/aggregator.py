@@ -14,7 +14,12 @@ from dggt.layers import PatchEmbed
 from dggt.layers.block import Block
 from dggt.layers.rope import RotaryPositionEmbedding2D, PositionGetter
 from dggt.layers.vision_transformer import vit_small, vit_base, vit_large, vit_giant2
-from dggt.models.DGDA import inject_dgda, prepare_dynamic_conf, clear_dynamic_conf
+from dggt.models.DGDA import (
+    inject_dgda,
+    prepare_dynamic_conf,
+    clear_dynamic_conf,
+    set_chunk_dynamic_conf_from_update_predictor,
+)
 from IPython import embed
 logger = logging.getLogger(__name__)
 
@@ -195,6 +200,8 @@ class Aggregator(nn.Module):
         start_layer: int = 16,
         targets: List[str] = ("attn.qkv", "attn.proj"),
         freeze_backbone: bool = True,
+        use_mask_update: bool = False,
+        chunk_size: int = 4,
     ) -> None:
         """
         向 frame_blocks / global_blocks 的高层 Attention 注入 DynamicGatedLoRA。
@@ -202,12 +209,14 @@ class Aggregator(nn.Module):
         默认策略（方案 C）：仅 layer 16-23 的 attn.qkv + attn.proj，共 32 个 DGDA 模块。
 
         Args:
-            r:               LoRA 秩
-            lora_alpha:      LoRA 缩放系数
-            dropout:         LoRA 输入 Dropout 率
-            start_layer:     从哪一层开始注入（默认 16）
-            targets:         Block 内要替换的子 Linear 路径
-            freeze_backbone: 若 True，冻结全部骨干，只保留 DGDA 参数可训练
+            r:                  LoRA 秩
+            lora_alpha:         LoRA 缩放系数
+            dropout:            LoRA 输入 Dropout 率
+            start_layer:        从哪一层开始注入（默认 16）
+            targets:            Block 内要替换的子 Linear 路径
+            freeze_backbone:    若 True，冻结全部骨干，只保留 DGDA 参数可训练
+            use_mask_update:  若 True，第二遍注入后每 chunk_size 层在输入掩码上加网络预测偏置
+            chunk_size:       每几层更新一次掩码（默认 4）
         """
         self._dgda_start_layer = start_layer
         inject_dgda(
@@ -218,6 +227,8 @@ class Aggregator(nn.Module):
             start_layer=start_layer,
             targets=list(targets),
             freeze_backbone=freeze_backbone,
+            use_mask_update=use_mask_update,
+            chunk_size=chunk_size,
         )
 
     def forward(
@@ -290,23 +301,47 @@ class Aggregator(nn.Module):
 
         # 将 dynamic_conf 注入到高层 DGDA 模块（仅当 enable_dgda() 已被调用时生效）
         dgda_start = getattr(self, "_dgda_start_layer", None)
+        dgda_chunk_size = getattr(self, "_dgda_chunk_size", 4)
         if dgda_start is not None:
             prepare_dynamic_conf(self, dynamic_conf, B, S, P, start_layer=dgda_start)
 
         frame_idx = 0
         global_idx = 0
         output_list = []
-
-
         output_list_with_tokens = []
 
         for _ in range(self.aa_block_num):
             for attn_type in self.aa_order:
                 if attn_type == "frame":
+                    # 第二遍注入时：每 chunk_size 层在输入掩码上加网络预测偏置，updated = (mask + delta).clamp(0,1)
+                    if dgda_start is not None and dynamic_conf is not None and hasattr(self, "dgda_mask_update_predictor"):
+                        if frame_idx in (dgda_start, dgda_start + dgda_chunk_size):
+                            chunk_index = (frame_idx - dgda_start) // dgda_chunk_size
+                            tokens_f = tokens.view(B, S, P, C).view(B * S, P, C)
+                            block0 = self.frame_blocks[frame_idx]
+                            current_mask = getattr(block0.attn.qkv, "_dynamic_conf", None)
+                            if current_mask is not None:
+                                delta = self.dgda_mask_update_predictor(tokens_f, current_mask)
+                                updated = (current_mask + delta).clamp(0.0, 1.0)
+                                set_chunk_dynamic_conf_from_update_predictor(
+                                    self, "frame", chunk_index, updated, dgda_start, dgda_chunk_size
+                                )
                     tokens, frame_idx, frame_intermediates = self._process_frame_attention(
                         tokens, B, S, P, C, frame_idx, pos=pos
                     )
                 elif attn_type == "global":
+                    if dgda_start is not None and dynamic_conf is not None and hasattr(self, "dgda_mask_update_predictor"):
+                        if global_idx in (dgda_start, dgda_start + dgda_chunk_size):
+                            chunk_index = (global_idx - dgda_start) // dgda_chunk_size
+                            tokens_g = tokens.view(B, S * P, C)
+                            block0 = self.global_blocks[global_idx]
+                            current_mask = getattr(block0.attn.qkv, "_dynamic_conf", None)
+                            if current_mask is not None:
+                                delta = self.dgda_mask_update_predictor(tokens_g, current_mask)
+                                updated = (current_mask + delta).clamp(0.0, 1.0)
+                                set_chunk_dynamic_conf_from_update_predictor(
+                                    self, "global", chunk_index, updated, dgda_start, dgda_chunk_size
+                                )
                     tokens, global_idx, global_intermediates = self._process_global_attention(
                         tokens, B, S, P, C, global_idx, pos=pos
                     )
