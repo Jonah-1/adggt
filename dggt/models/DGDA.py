@@ -226,6 +226,9 @@ def prepare_dynamic_conf(  #将输入的dynamic_conf初始化给所有的Dynamic
     if dynamic_conf is None:
         return
 
+    # instance_head 可能返回 [B, S, H, W, 1]，先压成 4D
+    if dynamic_conf.dim() == 5:
+        dynamic_conf = dynamic_conf.squeeze(-1)
     # 展平空间维度：[B, S, H, W] → [B, S, P_patch]
     if dynamic_conf.dim() == 4:
         dynamic_conf = dynamic_conf.view(B, S, -1)

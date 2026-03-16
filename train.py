@@ -38,6 +38,12 @@ def parse_args():
     parser.add_argument('--ckpt_path', type=str, default='')
     parser.add_argument('--log_dir', type=str, default='logs/xxx')
     parser.add_argument('--sequence_length', type=int, default=4)#8,4
+    parser.add_argument(
+        '--train_list',
+        type=str,
+        default='',
+        help='Optional txt file listing training scene ids/names (one per line). Overrides the default [300,600) range.',
+    )
     parser.add_argument('--chunk_size', type=int, default=4)
     parser.add_argument('--max_epoch', type=int, default=50000)
     parser.add_argument('--save_image', type=int, default=100)
@@ -56,6 +62,27 @@ def parse_args():
     parser.add_argument('--use_dgda_mask_update', action='store_true', help='when twopass, update mask every 4 layers from current features')
     return parser.parse_args()
 
+
+def _load_scene_list_txt(txt_path: str) -> list[str]:
+    scenes: list[str] = []
+    with open(txt_path, "r", encoding="utf-8") as f:
+        for raw in f:
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "#" in line:
+                line = line.split("#", 1)[0].strip()
+            if not line:
+                continue
+            token = line
+            # Common case: numeric ids like "3" / "003" -> normalize to "003"
+            if token.isdigit() and len(token) <= 6:
+                if len(token) <= 3:
+                    token = token.zfill(3)
+            scenes.append(token)
+    return scenes
+
+
 def main(args):
     dist.init_process_group(backend='nccl')
     args.local_rank = int(os.environ["LOCAL_RANK"])
@@ -63,7 +90,18 @@ def main(args):
     device = torch.device("cuda", args.local_rank)
     dtype = torch.float32
     
-    dataset = WaymoOpenDataset(args.image_dir, scene_names=[str(i).zfill(3) for i in range(300,600)], sequence_length=args.sequence_length, mode=1, views=1)
+    if args.train_list:
+        scene_names = _load_scene_list_txt(args.train_list)
+    else:
+        scene_names = [str(i).zfill(3) for i in range(300, 600)]
+
+    dataset = WaymoOpenDataset(
+        args.image_dir,
+        scene_names=scene_names,
+        sequence_length=args.sequence_length,
+        mode=1,
+        views=1,
+    )
     sampler = DistributedSampler(dataset,shuffle=True)
     dataloader = DataLoader(dataset, batch_size=args.batch_size, sampler=sampler, num_workers=4)
 

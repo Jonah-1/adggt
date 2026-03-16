@@ -147,6 +147,8 @@ def main():
     if args.use_dgda and args.dgda_ckpt and os.path.isfile(args.dgda_ckpt):
         model.load_dgda(args.dgda_ckpt)
         print("[DGDA] loaded adapter from %s" % args.dgda_ckpt)
+    if args.use_dgda:
+        model.to(device)  # 注入的 DGDA 子模块默认在 CPU，需再次移到 GPU
     if args.mode == 3:
         track_ckpt = 'path_to_track_model'
         track_model = load_model(track_ckpt)
@@ -155,7 +157,7 @@ def main():
     model.eval()
     psnr_list, ssim_list, lpips_list = [], [], []
     inference_time_list = []
-    scene_idx = 1
+    scene_idx = 0
 
     with torch.no_grad():
         for batch in dataloader:

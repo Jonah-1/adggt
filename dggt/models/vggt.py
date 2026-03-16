@@ -8,6 +8,7 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from huggingface_hub import PyTorchModelHubMixin  # used for model hub
 
 from dggt.models.aggregator import Aggregator
@@ -113,7 +114,17 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
 
         if getattr(self, "use_dgda_twopass", False) and dynamic_conf is None:
             pred1 = self._forward_impl(images, query_points, None)
-            return self._forward_impl(images, query_points, pred1["dynamic_conf"])
+            dc = pred1["dynamic_conf"]
+            # instance_head 输出为图像分辨率 [B,S,H,W(,1)]，aggregator 需要 patch 分辨率 [B,S,H_patch,W_patch]
+            if dc.dim() >= 4:
+                dc = dc.squeeze(-1) if dc.dim() == 5 else dc
+                B, S, H, W = dc.shape
+                ps = self.aggregator.patch_size
+                Hp, Wp = H // ps, W // ps
+                dc = dc.reshape(B * S, 1, H, W)
+                dc = F.adaptive_avg_pool2d(dc, (Hp, Wp))
+                dc = dc.reshape(B, S, Hp, Wp)
+            return self._forward_impl(images, query_points, dc)
 
         return self._forward_impl(images, query_points, dynamic_conf)
 

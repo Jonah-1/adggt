@@ -117,14 +117,17 @@ And download vggt pretrained model [here](https://huggingface.co/facebook/VGGT-1
 You can train the model on the Waymo Open dataset.
 ```bash
 torchrun --nproc_per_node=1 --master_port=0000 train.py \
+  --image_dir /path/to/processed_waymo \
   --log_dir logs/xxx \
-  --ckpt_path /path/to/pretrained_checkpoint.pth 
+  --ckpt_path /path/to/pretrained_checkpoint.pth \
+  --train_list /path/to/train.txt
 ```
 
     --image_dir <path>: Path to the Waymo dataset directory containing processed training data (required).
     --log_dir <path>: Directory where training logs, checkpoints, and visualizations will be saved (required).
     --ckpt_path <path>: Path to the pretrained model checkpoint to initialize weights (required).
     --sequence_length <length>: Number of input frames for each training iteration, defaulting to 4 (optional).
+    --train_list <path>: Optional txt file listing training scene ids/names (one per line). If provided, overrides the default training split.
 
 
 ### Zero-shot and trained experiment​s
